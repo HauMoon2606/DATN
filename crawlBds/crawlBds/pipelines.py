@@ -20,7 +20,6 @@ from confluent_kafka.admin import AdminClient
 from confluent_kafka import Producer
 
 
-# TFIDF_VECTORIZER_PATH = './save/ha-noi/tfidf_model.pkl'
 
 class BatdongsanPipeline:
     def process_item(self, item, spider):
@@ -254,20 +253,18 @@ class FieldsPreprocessPipeline:
     def square_preprocess(self, item):
         """Preprocess square field to meter square unit"""
         square = item['square']
-        if not square:
-            pass
-        elif isinstance(square, str):
-            square = square.strip().replace('m2', '').replace('m²', '').replace('m', '')
-            square = float(square)
-
-            if square < 0:
-                square = None
-        elif isinstance(square, float):
-            pass
-        else:
-            pass
+        if isinstance(square, str):
+            try:
+                square = square.strip().lower()
+                square = square.replace('m2', '').replace('m²', '').replace('m', '')
+                square = float(square)
+                if square < 0:
+                    return None
+            except ValueError:
+                return None
+        elif not isinstance(square, float):
+            return None
         return square
-    
     def price_preprocess(self, item):
         """Preprocess price field to VND unit"""
         price = item['price']
@@ -305,15 +302,29 @@ class FieldsPreprocessPipeline:
         # item['price'] = price
         return price
     
-    def contact_info_preprocess(self, item):
-        contact_info = item['contact_info']
-        for i, phone in enumerate(contact_info['phone']):
-            item['contact_info']['phone'][i] = phone.replace('.', '')
-        return contact_info
+    # def contact_info_preprocess(self, item):
+    #     contact_info = item['contact_info']
+    #     for i, phone in enumerate(contact_info['phone']):
+    #         item['contact_info']['phone'][i] = phone.replace('.', '')
+    #     return contact_info
     
+    # def contact_info_preprocess(self, item):
+    #     contact_info = item['contact_info']
+    #     phone = contact_info.get('phone', '')
+
+    #     if isinstance(phone, list):
+    #         contact_info['phone'] = [p.replace('.', '') for p in phone]
+    #     elif isinstance(phone, str):
+    #         contact_info['phone'] = phone.replace('.', '')
+    #     else:
+    #         contact_info['phone'] = ''
+
+    #     return contact_info
+
     def post_date_preprocess(self, item):
         # Reformat post_date to Y/M/D to allow comparison
         post_date = item['post_date']
+        post_date = post_date.replace('-', '/')
         day, month, year = post_date.split('/')
         post_date = f'{year}/{month}/{day}'
         return post_date
@@ -323,63 +334,12 @@ class FieldsPreprocessPipeline:
 
         adapter['square'] = self.square_preprocess(item)
         adapter['price'] = self.price_preprocess(item)
-        adapter['contact_info'] = self.contact_info_preprocess(item)
+        # adapter['contact_info'] = self.contact_info_preprocess(item)
         adapter['post_date'] = self.post_date_preprocess(item)
         return item
-
-
-# class DuplicateCheckPipeline:
-#     def __init__(self):
-#         with open(TFIDF_VECTORIZER_PATH, 'rb') as f:
-#             self.vectorizer = pickle.load(f)
-        
-#         # Save real estates title and its description tfidf vector as dict
-#         self.real_estates = list()
-#         # Restrict list size for efficient check
-#         self.max_list_len = 4000
-
-#     def  _is_similar(self, saved, candidate):
-#         # Get titles
-#         saved_title = saved['title']
-#         candidate_title = candidate['title']
-
-#         # Get description tfidf vectors
-#         saved_description_vector = saved['description_vector']
-#         candidate_description_vector = candidate['description_vector']
-
-#         similarity = cosine_similarity(saved_description_vector, candidate_description_vector).item()
-
-#         is_similar = (saved_title == candidate_title and similarity > 0.95) or similarity > 0.99
-#         # Return True if same title or descriptions have high similarity
-#         return is_similar, candidate_description_vector
-    
-#     def process_item(self, item, spider):
-#         # Reduce list to avoid full ram
-#         if len(self.real_estates) > self.max_list_len:
-#             self.real_estates = self.real_estates[int(self.max_list_len/4):] 
-
-#         adapter = ItemAdapter(item)
-#         candidate = {'title': adapter.get('title'), 'description_vector': self.vectorizer.transform([adapter.get('description')]), 'post_id': adapter.get('post_id')}
-#         # Check if the current real estate is already scraped
-#         for real_estate in self.real_estates:
-#             is_similar, candidate_description_vector = self._is_similar(saved=real_estate, candidate=candidate)
-#             if is_similar:
-#                 raise DropItem(f'This real estate has already been collected at {real_estate["post_id"]}')
-                    
-#         # If first time see the real estate, add it to the list
-#         self.real_estates.append(candidate)
-#         return item
     
 class PushToKafka:
-    """
-    Publishes a serialized item into a Kafka topic
-
-    :param producer: The Kafka producer
-    :type producer: kafka.producer.Producer
-
-    :param topic: The Kafka topic being used
-    :type topic: str or unicode
-    """
+    
     def __init__(self, kafka_bootstrap_servers):
         self.kafka_bootstrap_servers = kafka_bootstrap_servers
         self.producer = Producer({'bootstrap.servers': kafka_bootstrap_servers})
@@ -403,9 +363,67 @@ class PushToKafka:
         return item
     
     def _delivery_report(self, err, msg):
-        """ Called once for each message produced to indicate delivery result.
-            Triggered by poll() or flush(). """
         if err is not None:
             print('Message delivery failed: {}'.format(err))
         else:
             print('Message delivered to {} [{}]'.format(msg.topic(), msg.partition()))
+
+import boto3
+import json
+from io import BytesIO
+
+class MinioPipeline:
+    def __init__(self, minio_endpoint, access_key, secret_key, bucket_name):
+        self.minio_client = boto3.client(
+            's3',
+            endpoint_url=minio_endpoint,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+        )
+        self.bucket_name = bucket_name
+        self.file_key = None
+        self.items = []
+
+    @classmethod
+    def from_crawler(cls, crawler, *args, **kwargs):
+        minio_endpoint = crawler.settings.get('MINIO_ENDPOINT')
+        access_key = crawler.settings.get('MINIO_ACCESS_KEY')
+        secret_key = crawler.settings.get('MINIO_SECRET_KEY')
+        bucket_name = crawler.settings.get('MINIO_BUCKET')
+        
+        return cls(minio_endpoint, access_key, secret_key, bucket_name)
+
+    def open_spider(self, spider):
+        base_name = spider.name.replace('_spider', '')
+        self.file_key = f"{base_name}.json"
+
+    def process_item(self, item, spider):
+        self.items.append(dict(item))  
+        return item
+
+    def close_spider(self, spider):
+        self.upload_to_minio()
+        spider.logger.info(f'Data has been uploaded to MinIO as {self.file_key}')
+
+    def upload_to_minio(self):
+        existing_buckets = self.minio_client.list_buckets()
+        bucket_names = [b['Name'] for b in existing_buckets['Buckets']]
+        
+        if self.bucket_name not in bucket_names:
+            self.minio_client.create_bucket(Bucket=self.bucket_name)
+        
+        json_data = json.dumps(self.items, ensure_ascii=False, indent=2)
+
+        buffer = BytesIO()
+        buffer.write(json_data.encode('utf-8'))
+        buffer.seek(0)
+
+        # Upload to MinIO
+        self.minio_client.put_object(
+            Bucket=self.bucket_name,
+            Key=self.file_key,
+            Body=buffer,
+            ContentType='application/json'
+        )
+
+        
